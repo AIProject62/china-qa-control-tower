@@ -27,7 +27,8 @@ async function login(){let email=$q('#qaLoginEmail').value.trim(),password=$q('#
 async function profile(){let {data,error}=await sb.from('qa_profiles').select('user_id,email,role').eq('user_id',session.user.id).maybeSingle();if(error)throw error;return data}
 async function getAppState(){let {data,error}=await sb.from('qa_app_state').select('published_version_id').eq('id',1).maybeSingle();if(error)throw error;return data}
 async function getVersion(id){if(!id)return null;let {data,error}=await sb.from('qa_versions').select('*').eq('id',id).single();if(error)throw error;return data}
-async function loadEngineConfig(){try{let {data,error}=await sb.from('qa_engine_config').select('payload').eq('config_key','decode_overrides').maybeSingle();if(error)throw error;if(data?.payload&&typeof BASE_DECODE_OVERRIDES!=='undefined')BASE_DECODE_OVERRIDES=data.payload;return !!data?.payload}catch(e){console.warn('Engine config unavailable',e);return false}}
+function replaceObjectContents(target,source){if(!target||typeof target!=='object'||!source||typeof source!=='object')return;for(const k of Object.keys(target))delete target[k];Object.assign(target,source)}
+async function loadEngineConfig(){try{let {data,error}=await sb.from('qa_engine_config').select('payload').eq('config_key','decode_overrides').maybeSingle();if(error)throw error;if(data?.payload&&typeof BASE_DECODE_OVERRIDES!=='undefined')replaceObjectContents(BASE_DECODE_OVERRIDES,data.payload);return !!data?.payload}catch(e){console.warn('Engine config unavailable',e);return false}}
 async function fetchRows(table,versionId,expectedCount=0,onProgress){
  const size=Math.max(100,Math.min(1000,CFG.chunkSize||1000));
  // Published versions already store row counts. Use bounded parallel page reads so a
@@ -95,8 +96,8 @@ async function loadPublished(show=true){
 
    if(show){overlay(t('loading'),90);overlaySub('Building dashboard indexes…')}
    ISSUES=q;PROD=p;EVIDENCE=ev;
-   DATA_SOURCES={quality:`Supabase LIVE ${v.version_code}`,production:`Supabase LIVE ${v.version_code}`,evidence:`Supabase LIVE ${v.version_code}`};
-   NOTES={quality:'Central published version',production:'Central published version',evidence:'Central published version'};
+   if(typeof DATA_SOURCES!=='undefined')Object.assign(DATA_SOURCES,{quality:`Supabase LIVE ${v.version_code}`,production:`Supabase LIVE ${v.version_code}`,evidence:`Supabase LIVE ${v.version_code}`});
+   if(typeof NOTES!=='undefined'){NOTES.quality='Central published version';NOTES.production='Central published version';NOTES.evidence='Central published version'};
    await new Promise(r=>setTimeout(r,0));
    rebuildPublishedDerivedState();
 
@@ -121,8 +122,34 @@ function cleanPayload(obj){return JSON.parse(JSON.stringify(obj,(k,v)=>typeof v=
 function safeName(s){return String(s||'file').replace(/[^A-Za-z0-9_.!$@=;+?()&,' -]/g,'_').replace(/\s+/g,'_').slice(-150)}
 async function persistEvidence(rows,versionId,progress){let out=[];for(let i=0;i<rows.length;i++){let r={...rows[i]},existing=r.storage_path||'';if(!existing){let src=(r.asset_path||r.object_url||'');if(!src && r.thumb_path && typeof EMBEDDED_THUMBS!=='undefined')src=EMBEDDED_THUMBS[r.thumb_path]||'';if(src && (/^(blob:|data:)/.test(src))){try{let blob=await (await fetch(src)).blob();if(blob.size>50*1024*1024)throw new Error('Evidence file exceeds Supabase Free 50MB per-file limit: '+r.file_name);let path=`${versionId}/${String(r.attachment_id||i).replace(/[^A-Za-z0-9_-]/g,'_')}_${safeName(r.file_name)}`;let {error}=await sb.storage.from(CFG.evidenceBucket||'qa-evidence').upload(path,blob,{upsert:false,contentType:blob.type||undefined});if(error)throw error;r.storage_path=path}catch(e){console.warn('Evidence persistence skipped',r.file_name,e);r.storage_error=String(e.message||e)}}}r.asset_path='';r.object_url='';out.push(cleanPayload(r));if(progress)progress(i+1,rows.length)}return out}
 async function insertChunks(table,versionId,rows,label,startPct,endPct){let size=Math.max(100,Math.min(1000,CFG.chunkSize||1000));for(let i=0;i<rows.length;i+=size){let part=rows.slice(i,i+size).map((payload,j)=>({version_id:versionId,row_no:i+j+1,payload:cleanPayload(payload)}));let {error}=await sb.from(table).insert(part);if(error)throw error;let pct=startPct+(endPct-startPct)*Math.min(1,(i+part.length)/Math.max(1,rows.length));overlay(t('publishing'),pct);overlaySub(`${label}: ${Math.min(i+part.length,rows.length).toLocaleString()} / ${rows.length.toLocaleString()} rows`)}}
-async function importEngineConfig(e){let f=e.target.files?.[0];if(!f)return;try{let obj=JSON.parse(await f.text());if(!obj||Array.isArray(obj)||typeof obj!=='object')throw new Error('Invalid decode override JSON');let {error}=await sb.from('qa_engine_config').upsert({config_key:'decode_overrides',payload:obj,updated_by:session.user.id,updated_at:new Date().toISOString()},{onConflict:'config_key'});if(error)throw error;if(typeof BASE_DECODE_OVERRIDES!=='undefined')BASE_DECODE_OVERRIDES=obj;alert('Engine config imported: '+Object.keys(obj).length.toLocaleString()+' decode overrides.');}catch(err){alert('Engine config import failed: '+(err.message||err))}finally{e.target.value=''}}
-async function publishCurrent(){if(!confirm(t('confirm')))return;let s=countStats();overlay(t('publishing'),2);try{let now=new Date(),code=now.toISOString().replace(/[-:TZ.]/g,'').slice(0,14);let {data:v,error:e}=await sb.from('qa_versions').insert({version_code:code,status:'staging',created_by:session.user.id,quality_count:s.q,production_count:s.p,evidence_count:s.e,ready_count:s.ready,unresolved_count:s.unresolved,notes:'Published from China QA Admin Mode'}).select().single();if(e)throw e;let ev=await persistEvidence(typeof EVIDENCE!=='undefined'?EVIDENCE:[],v.id,(n,total)=>{overlay(t('publishing'),3+7*n/Math.max(1,total));overlaySub(`Evidence: ${n}/${total}`)});await insertChunks('qa_quality_rows',v.id,typeof ISSUES!=='undefined'?ISSUES:[],'Quality',10,42);await insertChunks('qa_production_rows',v.id,typeof PROD!=='undefined'?PROD:[],'SCM',42,84);await insertChunks('qa_evidence_rows',v.id,ev,'Evidence metadata',84,94);overlay(t('publishing'),96);let {error:pe}=await sb.rpc('qa_publish_version',{p_version:v.id});if(pe)throw pe;if(CFG.keepVersions){let {error:pruneErr}=await sb.rpc('qa_prune_versions',{p_keep:Number(CFG.keepVersions)});if(pruneErr)console.warn(pruneErr)}overlay(t('published'),100);await loadPublished(false);versionBar();renderAdminPanel();setTimeout(closeOverlay,900)}catch(e){console.error(e);overlay(t('failed'),100);overlaySub(e.message||String(e));setTimeout(closeOverlay,4500)}}
+async function importEngineConfig(e){let f=e.target.files?.[0];if(!f)return;try{let obj=JSON.parse(await f.text());if(!obj||Array.isArray(obj)||typeof obj!=='object')throw new Error('Invalid decode override JSON');let {error}=await sb.from('qa_engine_config').upsert({config_key:'decode_overrides',payload:obj,updated_by:session.user.id,updated_at:new Date().toISOString()},{onConflict:'config_key'});if(error)throw error;if(typeof BASE_DECODE_OVERRIDES!=='undefined')replaceObjectContents(BASE_DECODE_OVERRIDES,obj);alert('Engine config imported: '+Object.keys(obj).length.toLocaleString()+' decode overrides.');}catch(err){alert('Engine config import failed: '+(err.message||err))}finally{e.target.value=''}}
+async function publishCurrent(){
+ if(!confirm(t('confirm')))return;
+ let s=countStats(), publishedCommitted=false, createdVersion=null;
+ overlay(t('publishing'),2);
+ try{
+   let now=new Date(),code=now.toISOString().replace(/[-:TZ.]/g,'').slice(0,14);
+   let {data:v,error:e}=await sb.from('qa_versions').insert({version_code:code,status:'staging',created_by:session.user.id,quality_count:s.q,production_count:s.p,evidence_count:s.e,ready_count:s.ready,unresolved_count:s.unresolved,notes:'Published from China QA Admin Mode'}).select().single();
+   if(e)throw e; createdVersion=v;
+   let ev=await persistEvidence(typeof EVIDENCE!=='undefined'?EVIDENCE:[],v.id,(n,total)=>{overlay(t('publishing'),3+7*n/Math.max(1,total));overlaySub(`Evidence: ${n}/${total}`)});
+   await insertChunks('qa_quality_rows',v.id,typeof ISSUES!=='undefined'?ISSUES:[],'Quality',10,42);
+   await insertChunks('qa_production_rows',v.id,typeof PROD!=='undefined'?PROD:[],'SCM',42,84);
+   await insertChunks('qa_evidence_rows',v.id,ev,'Evidence metadata',84,94);
+   overlay(t('publishing'),96);
+   let {error:pe}=await sb.rpc('qa_publish_version',{p_version:v.id});if(pe)throw pe;
+   publishedCommitted=true;
+   // Do not re-download 70k+ rows after a successful publish. The current Admin
+   // working set is already the exact snapshot just written. Only refresh version metadata.
+   try{liveVersion=await getVersion(v.id)}catch(_){liveVersion={...v,status:'published',published_at:new Date().toISOString()}}
+   if(CFG.keepVersions){let {error:pruneErr}=await sb.rpc('qa_prune_versions',{p_keep:Number(CFG.keepVersions)});if(pruneErr)console.warn('Version prune warning',pruneErr)}
+   versionBar();renderAdminPanel();overlay(t('published'),100);overlaySub(`LIVE ${liveVersion?.version_code||code} · Q ${s.q.toLocaleString()} · SCM ${s.p.toLocaleString()}`);setTimeout(closeOverlay,1200);
+ }catch(e){
+   console.error(e);
+   // Never report “Publish failed” if the atomic publish RPC already succeeded.
+   if(publishedCommitted){overlay(t('published'),100);overlaySub('LIVE publish succeeded. A post-publish refresh step reported: '+(e.message||String(e)));setTimeout(closeOverlay,5000);return}
+   overlay(t('failed'),100);overlaySub(e.message||String(e));setTimeout(closeOverlay,6500)
+ }
+}
 async function renderHistory(){let el=$q('#qaVersionList');if(!el)return;el.innerHTML='Loading…';let {data,error}=await sb.from('qa_versions').select('*').order('created_at',{ascending:false}).limit(12);if(error){el.textContent=error.message;return}el.innerHTML=(data||[]).map(v=>`<div class="qa-version-row"><b>${escP(v.version_code)}</b><span>${escP(v.status)}</span><span>Q ${Number(v.quality_count||0).toLocaleString()} · SCM ${Number(v.production_count||0).toLocaleString()}</span><span>${escP(v.published_at?new Date(v.published_at).toLocaleString():'—')}</span>${v.status==='published'?'<span>LIVE</span>':`<button class="btn ghost qaRollback" data-id="${escP(v.id)}">Rollback</button>`}</div>`).join('')||'No versions';el.querySelectorAll('.qaRollback').forEach(b=>b.onclick=async()=>{if(!confirm(t('rollback')))return;overlay(t('publishing'),60);let {error}=await sb.rpc('qa_publish_version',{p_version:b.dataset.id});if(error){overlay(t('failed'),100);overlaySub(error.message);setTimeout(closeOverlay,3000);return}await loadPublished(false);renderAdminPanel();versionBar();closeOverlay()})}
 async function bootAfterAuth(){let {data:{session:s}}=await sb.auth.getSession();session=s;if(!session){addAuthGate();return}let p=await profile();if(MODE==='admin'&&p?.role!=='admin'){addAuthGate(t('adminOnly'));return}hideAuth();versionBar();await loadEngineConfig();if(MODE==='viewer'){document.body.classList.add('qa-viewer-mode');await loadPublished(true)}else{document.body.classList.add('qa-admin-mode');adminPanel();let had=await loadPublished(true);adminPanel();renderAdminPanel();if(!had)versionBar()}wrapLanguage()}
 function wrapLanguage(){if(typeof setLanguageV7==='function'&&!setLanguageV7.__qaWrapped){let base=setLanguageV7;let wrapped=function(x){let r=base(x);versionBar();if(MODE==='admin')renderAdminPanel();return r};wrapped.__qaWrapped=true;setLanguageV7=wrapped}}

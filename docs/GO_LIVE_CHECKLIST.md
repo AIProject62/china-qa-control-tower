@@ -1,0 +1,24 @@
+# Go-Live Checklist
+
+- [ ] Supabase project created
+- [ ] `supabase/schema.sql` executed without errors
+- [ ] Admin Auth user exists
+- [ ] `qa_profiles.role` changed to `admin` for the intended admin
+- [ ] Viewer test user exists and remains `viewer`
+- [ ] `site/app-config.js` contains Project URL + publishable key only
+- [ ] GitHub repository created
+- [ ] GitHub Pages source set to GitHub Actions
+- [ ] Viewer URL requires sign-in
+- [ ] Viewer cannot see Data Upload Center
+- [ ] Viewer cannot insert/update/delete Supabase rows (RLS test)
+- [ ] Admin sees Data Upload Center + Production Data Management panel
+- [ ] One-time Decode Overrides JSON imported to Supabase (not committed to GitHub)
+- [ ] Dummy Quality + SCM upload reconciles as expected
+- [ ] Publish creates a new version
+- [ ] Viewer refresh shows the same version code and numbers
+- [ ] Rollback to previous retained version works
+- [ ] ENG / INDO / 中文 tested
+- [ ] Light / Dark tested
+- [ ] Executive period note = Quality Issue Date
+- [ ] Quality Issue Ratio period note = Production Date
+- [ ] K103=SMD, K104=RCK, K118=MJL verified in Reconciliation Audit

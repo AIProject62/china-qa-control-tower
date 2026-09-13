@@ -28,11 +28,92 @@ async function profile(){let {data,error}=await sb.from('qa_profiles').select('u
 async function getAppState(){let {data,error}=await sb.from('qa_app_state').select('published_version_id').eq('id',1).maybeSingle();if(error)throw error;return data}
 async function getVersion(id){if(!id)return null;let {data,error}=await sb.from('qa_versions').select('*').eq('id',id).single();if(error)throw error;return data}
 async function loadEngineConfig(){try{let {data,error}=await sb.from('qa_engine_config').select('payload').eq('config_key','decode_overrides').maybeSingle();if(error)throw error;if(data?.payload&&typeof BASE_DECODE_OVERRIDES!=='undefined')BASE_DECODE_OVERRIDES=data.payload;return !!data?.payload}catch(e){console.warn('Engine config unavailable',e);return false}}
-async function fetchRows(table,versionId){let all=[],size=Math.max(100,Math.min(1000,CFG.chunkSize||1000));for(let from=0;;from+=size){let {data,error}=await sb.from(table).select('row_no,payload').eq('version_id',versionId).order('row_no',{ascending:true}).range(from,from+size-1);if(error)throw error;all.push(...(data||[]).map(x=>x.payload));if(!data||data.length<size)break}return all}
-async function hydrateEvidence(rows){let paths=rows.map(x=>x.storage_path).filter(Boolean);if(!paths.length)return rows;let {data,error}=await sb.storage.from(CFG.evidenceBucket||'qa-evidence').createSignedUrls(paths,3600);if(error){console.warn(error);return rows}let map=new Map((data||[]).map(x=>[x.path,x.signedUrl]));return rows.map(x=>{if(x.storage_path&&map.get(x.storage_path)){let u=map.get(x.storage_path);return {...x,asset_path:u,object_url:/^(JPG|JPEG|PNG|WEBP|GIF)$/i.test(x.file_type||'')?u:''}}return x})}
-async function loadPublished(show=true){if(show)overlay(t('loading'),5);let st=await getAppState();if(!st?.published_version_id){if(show){overlaySub(t('noLive'));setTimeout(closeOverlay,2500)}return false}let v=await getVersion(st.published_version_id);if(show)overlay(t('loading'),15);let q=await fetchRows('qa_quality_rows',v.id);if(show){overlay(t('loading'),42);overlaySub(`${q.length.toLocaleString()} Quality rows`)}let p=await fetchRows('qa_production_rows',v.id);if(show){overlay(t('loading'),70);overlaySub(`${p.length.toLocaleString()} SCM rows`)}let ev=await fetchRows('qa_evidence_rows',v.id);ev=await hydrateEvidence(ev);if(show)overlay(t('loading'),90);
- try{ISSUES=q;PROD=p;EVIDENCE=ev;DATA_SOURCES={quality:`Supabase LIVE ${v.version_code}`,production:`Supabase LIVE ${v.version_code}`,evidence:`Supabase LIVE ${v.version_code}`};NOTES={quality:'Central published version',production:'Central published version',evidence:'Central published version'};if(typeof reconcileV4==='function')reconcileV4();if(typeof refreshOptions==='function')refreshOptions(true);if(typeof relinkEvidence==='function')relinkEvidence();if(typeof applyV4==='function')applyV4();else if(typeof apply==='function')apply();}catch(e){console.error('Dashboard hydrate failed',e);throw e}
- liveVersion=v;versionBar();if(show){overlay(t('loading'),100);setTimeout(closeOverlay,300)}return true}
+async function fetchRows(table,versionId,expectedCount=0,onProgress){
+ const size=Math.max(100,Math.min(1000,CFG.chunkSize||1000));
+ // Published versions already store row counts. Use bounded parallel page reads so a
+ // 60k+ row SCM dataset does not require 60+ strictly sequential HTTP round trips.
+ if(Number(expectedCount)>0){
+   const total=Number(expectedCount), pages=Math.ceil(total/size), concurrency=6, chunks=new Array(pages);
+   for(let base=0;base<pages;base+=concurrency){
+     const jobs=[];
+     for(let page=base;page<Math.min(pages,base+concurrency);page++){
+       const from=page*size;
+       jobs.push((async()=>{let {data,error}=await sb.from(table).select('row_no,payload').eq('version_id',versionId).order('row_no',{ascending:true}).range(from,Math.min(total-1,from+size-1));if(error)throw error;chunks[page]=(data||[]).map(x=>x.payload)})());
+     }
+     await Promise.all(jobs);
+     if(onProgress)onProgress(Math.min(total,(base+jobs.length)*size),total);
+     // Let the browser paint progress between network batches.
+     await new Promise(r=>setTimeout(r,0));
+   }
+   return chunks.flat();
+ }
+ let all=[];for(let from=0;;from+=size){let {data,error}=await sb.from(table).select('row_no,payload').eq('version_id',versionId).order('row_no',{ascending:true}).range(from,from+size-1);if(error)throw error;all.push(...(data||[]).map(x=>x.payload));if(onProgress)onProgress(all.length,0);if(!data||data.length<size)break;await new Promise(r=>setTimeout(r,0))}return all
+}
+async function hydrateEvidence(rows){
+ let paths=rows.map(x=>x.storage_path).filter(Boolean);if(!paths.length)return rows;
+ // Signed URL creation is batched to avoid one oversized request when Evidence grows.
+ const map=new Map(), batch=100;
+ for(let i=0;i<paths.length;i+=batch){let part=paths.slice(i,i+batch),{data,error}=await sb.storage.from(CFG.evidenceBucket||'qa-evidence').createSignedUrls(part,3600);if(error){console.warn(error);continue}(data||[]).forEach(x=>map.set(x.path,x.signedUrl));await new Promise(r=>setTimeout(r,0))}
+ return rows.map(x=>{if(x.storage_path&&map.get(x.storage_path)){let u=map.get(x.storage_path);return {...x,asset_path:u,object_url:/^(JPG|JPEG|PNG|WEBP|GIF)$/i.test(x.file_type||'')?u:''}}return x})
+}
+function rebuildPublishedDerivedState(){
+ // IMPORTANT: published Quality rows already contain validated reconciliation fields.
+ // Re-loading LIVE must NOT decode/reconcile 9k Quality rows again. We only rebuild the
+ // lightweight indexes needed by drilldowns and denominator de-duplication.
+ if(typeof buildProdIndex==='function')buildProdIndex();
+ if(typeof RECON!=='undefined')RECON=ISSUES;
+ if(typeof BATCH_MASTER!=='undefined'){
+   const g=new Map();
+   for(const r of ISSUES){if(r.readiness!=='READY'||!r.recon_key)continue;let k=r.recon_key;if(!g.has(k))g.set(k,{recon_key:k,sku:r.sku,sku_group:r.sku_group,product_name:r.product_name,production_date:r.production_date,production_month:r.production_month,factory:r.resolved_plant,shift_scope:r.shift_decoded?`SHIFT${r.shift_decoded}`:'ALL_SHIFT',coding_token:r.coding_token,scm_batches:new Set(),production_qty:Number(r.production_qty)||0,issue_qty:0,events:0,oas:new Set(),classes:new Set()});let b=g.get(k);b.issue_qty+=Number(r.qty)||0;b.events++;if(r.oa_code)b.oas.add(r.oa_code);if(r.issue_class)b.classes.add(r.issue_class);String(r.scm_batches||'').split(';').filter(Boolean).forEach(x=>b.scm_batches.add(x))}
+   BATCH_MASTER=[...g.values()].map(b=>({...b,scm_batches:[...b.scm_batches].join(';'),oa_count:b.oas.size,issue_classes:[...b.classes].join('; '),rate:b.production_qty?b.issue_qty/b.production_qty:null,ppm:b.production_qty?b.issue_qty/b.production_qty*1e6:null}));
+ }
+ if(typeof MEMBERS!=='undefined'){
+   MEMBERS.clear();
+   for(const r of ISSUES){if(r.readiness!=='READY'||!r.recon_key||MEMBERS.has(r.recon_key))continue;let key=r.shift_decoded?v3keyps(r.sku,r.production_date,r.resolved_plant,r.shift_decoded):v3keyp(r.sku,r.production_date,r.resolved_plant);let rows=(r.shift_decoded?PROD_INDEX?.bySkuDatePlantShift:PROD_INDEX?.bySkuDatePlant)?.get(key)||[];MEMBERS.set(r.recon_key,rows)}
+ }
+ if(typeof relinkEvidence==='function')relinkEvidence();
+}
+async function loadPublished(show=true){
+ const started=performance.now();
+ try{
+   if(show){overlay(t('loading'),5);overlaySub('Checking LIVE version…')}
+   let st=await getAppState();
+   if(!st?.published_version_id){if(show){overlaySub(t('noLive'));setTimeout(closeOverlay,2500)}return false}
+   let v=await getVersion(st.published_version_id);
+   if(show){overlay(t('loading'),12);overlaySub(`LIVE ${v.version_code}`)}
+
+   // Quality, SCM and Evidence are independent tables: fetch them in parallel.
+   let qProgress=0,pProgress=0,eProgress=0;
+   const updateProgress=()=>{if(!show)return;let qTot=Math.max(1,Number(v.quality_count)||1),pTot=Math.max(1,Number(v.production_count)||1),eTot=Math.max(1,Number(v.evidence_count)||1);let weighted=.18*(qProgress/qTot)+.55*(pProgress/pTot)+.07*(eProgress/eTot);overlay(t('loading'),12+Math.min(.80,weighted)*72);overlaySub(`${qProgress.toLocaleString()} Quality · ${pProgress.toLocaleString()} SCM · ${eProgress.toLocaleString()} Evidence rows`)};
+   const qPromise=fetchRows('qa_quality_rows',v.id,v.quality_count,(n)=>{qProgress=n;updateProgress()});
+   const pPromise=fetchRows('qa_production_rows',v.id,v.production_count,(n)=>{pProgress=n;updateProgress()});
+   const ePromise=fetchRows('qa_evidence_rows',v.id,v.evidence_count,(n)=>{eProgress=n;updateProgress()});
+   let [q,p,ev]=await Promise.all([qPromise,pPromise,ePromise]);
+   qProgress=q.length;pProgress=p.length;eProgress=ev.length;updateProgress();
+   if(show){overlay(t('loading'),86);overlaySub('Preparing evidence links…')}
+   ev=await hydrateEvidence(ev);
+
+   if(show){overlay(t('loading'),90);overlaySub('Building dashboard indexes…')}
+   ISSUES=q;PROD=p;EVIDENCE=ev;
+   DATA_SOURCES={quality:`Supabase LIVE ${v.version_code}`,production:`Supabase LIVE ${v.version_code}`,evidence:`Supabase LIVE ${v.version_code}`};
+   NOTES={quality:'Central published version',production:'Central published version',evidence:'Central published version'};
+   await new Promise(r=>setTimeout(r,0));
+   rebuildPublishedDerivedState();
+
+   if(show){overlay(t('loading'),95);overlaySub('Rendering dashboard…')}
+   await new Promise(r=>setTimeout(r,0));
+   if(typeof refreshOptions==='function')refreshOptions(true);
+   if(typeof applyV4==='function')applyV4();else if(typeof apply==='function')apply();
+
+   liveVersion=v;versionBar();
+   if(show){overlay(t('loading'),100);overlaySub(`Ready in ${((performance.now()-started)/1000).toFixed(1)}s`);setTimeout(closeOverlay,500)}
+   return true;
+ }catch(e){
+   console.error('LIVE load failed',e);
+   if(show){overlay('LIVE load failed',100);overlaySub(e.message||String(e));setTimeout(closeOverlay,8000)}
+   throw e;
+ }
+}
 function countStats(){let ready=(typeof ISSUES!=='undefined'?ISSUES:[]).filter(x=>x.readiness==='READY').length;let total=(typeof ISSUES!=='undefined'?ISSUES:[]).length;return {q:total,p:(typeof PROD!=='undefined'?PROD:[]).length,e:(typeof EVIDENCE!=='undefined'?EVIDENCE:[]).length,ready,unresolved:total-ready}}
 function adminPanel(){let page=document.getElementById('readiness');if(!page||$q('#qaAdminPanel'))return;let panel=document.createElement('div');panel.id='qaAdminPanel';panel.className='qa-admin-panel';page.insertBefore(panel,page.firstChild);renderAdminPanel();}
 function renderAdminPanel(){let e=$q('#qaAdminPanel');if(!e)return;let s=countStats();e.innerHTML=`<h3>Production Data Management</h3><div class="qa-live-note">${escP(t('localStage'))}</div><div class="qa-admin-grid"><div class="qa-admin-stat"><small>${escP(t('quality'))}</small><b>${s.q.toLocaleString()}</b></div><div class="qa-admin-stat"><small>${escP(t('prod'))}</small><b>${s.p.toLocaleString()}</b></div><div class="qa-admin-stat"><small>${escP(t('ready'))}</small><b>${s.ready.toLocaleString()}</b></div><div class="qa-admin-stat"><small>${escP(t('unresolved'))}</small><b>${s.unresolved.toLocaleString()}</b></div></div><div class="qa-admin-actions"><button class="btn" id="qaPublishBtn">${escP(t('publish'))}</button><button class="btn ghost" id="qaLoadLiveBtn">${escP(t('live'))}</button><button class="btn ghost" id="qaHistoryBtn">${escP(t('history'))}</button><label class="btn ghost" style="width:auto;cursor:pointer">Import Engine Config<input id="qaEngineConfigFile" type="file" accept="application/json,.json" hidden></label></div><div class="qa-version-list" id="qaVersionList"></div>`;$q('#qaPublishBtn').onclick=publishCurrent;$q('#qaLoadLiveBtn').onclick=()=>loadPublished(true).then(()=>renderAdminPanel());$q('#qaHistoryBtn').onclick=renderHistory;$q('#qaEngineConfigFile').onchange=importEngineConfig;}
